@@ -1,0 +1,198 @@
+import streamlit as st
+import io
+from typing import List, Optional
+import pdfplumber
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
+import requests
+import os
+
+GRANITE_API_ENDPOINT = os.getenv("GRANITE_API_ENDPOINT", "https://api.ibm-granite.example/v1/generate")
+GRANITE_API_KEY = os.getenv("GRANITE_API_KEY", "YOUR_GRANITE_API_KEY_HERE")
+MOCK_MODE = GRANITE_API_KEY == "YOUR_GRANITE_API_KEY_HERE"
+
+def granite_api_query(prompt: str, max_tokens: int = 512) -> str:
+    if MOCK_MODE:
+        return "(Mock Granite) " + prompt[:800]
+    headers = {"Authorization": f"Bearer {GRANITE_API_KEY}", "Content-Type": "application/json"}
+    payload = {"prompt": prompt, "max_tokens": max_tokens}
+    try:
+        resp = requests.post(GRANITE_API_ENDPOINT, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict):
+            for k in ("text", "result", "output", "response"):
+                if k in data and isinstance(data[k], str):
+                    return data[k]
+            return str(data)
+        return str(data)
+    except Exception as e:
+        return f"Error contacting AI service: {e}"
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    text_pieces: List[str] = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                text_pieces.append(page_text)
+    except Exception:
+        text_pieces = [""]
+    concatenated = "\n\n".join(text_pieces).strip()
+    if concatenated and len(concatenated) > 50:
+        return concatenated
+    if OCR_AVAILABLE:
+        try:
+            images = convert_from_bytes(pdf_bytes)
+            ocr_texts = []
+            for img in images:
+                ocr_texts.append(pytesseract.image_to_string(img))
+            return "\n\n".join(ocr_texts).strip()
+        except Exception:
+            pass
+    return concatenated
+
+st.set_page_config(page_title="StudyMate", layout="centered")
+
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: white; }
+    textarea, input, .user-bubble, .bot-bubble { color: #000000 !important; }
+    .user-bubble { background: #ffffff; padding:10px; border-radius:12px; margin:6px 0; border:1px solid #ddd; }
+    .bot-bubble { background: #ffffff; padding:10px; border-radius:12px; margin:6px 0; border:1px solid #ddd; }
+    .stButton>button { background: #4f46e5; color: white; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("StudyMate")
+st.write("Please upload your PDF to begin.")
+
+if "pdf_text" not in st.session_state:
+    st.session_state.pdf_text = ""
+if "pdf_name" not in st.session_state:
+    st.session_state.pdf_name = ""
+if "pdf_bytes" not in st.session_state:
+    st.session_state.pdf_bytes = b""
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "last_summary" not in st.session_state:
+    st.session_state.last_summary = ""
+
+uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+if uploaded_file is not None:
+    file_bytes = uploaded_file.read()
+    extracted = extract_text_from_pdf_bytes(file_bytes)
+    if extracted and len(extracted) > 20:
+        st.session_state.pdf_text = extracted
+        st.session_state.pdf_name = uploaded_file.name
+        st.session_state.pdf_bytes = file_bytes
+        st.success(f"Uploaded and read: {uploaded_file.name}")
+    else:
+        st.error("Could not extract text from the PDF. If scanned, please install Tesseract or upload a text-based PDF.")
+
+chat_col, control_col = st.columns([3, 1])
+
+with chat_col:
+    st.subheader("Chat")
+    for msg in st.session_state.messages:
+        if msg["role"] == "user":
+            st.markdown(f"<div class='user-bubble'><strong>You:</strong><br>{msg['text']}</div>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div class='bot-bubble'><strong>StudyMate:</strong><br>{msg['text']}</div>", unsafe_allow_html=True)
+    user_input = st.text_input("Ask a question", key="user_input_box")
+    submit_col, explain_col, expand_col = st.columns(3)
+    with submit_col:
+        ask = st.button("Send")
+    with explain_col:
+        simplify = st.button("Explain simpler")
+    with expand_col:
+        expand = st.button("Make longer")
+
+with control_col:
+    st.subheader("Controls")
+    summarize = st.button("Summarize PDF")
+    if st.session_state.pdf_text:
+        st.write(f"Loaded: {st.session_state.pdf_name}")
+        if st.button("Clear uploaded PDF"):
+            st.session_state.pdf_text = ""
+            st.session_state.pdf_name = ""
+            st.session_state.pdf_bytes = b""
+            st.session_state.messages = []
+            st.session_state.last_summary = ""
+
+def answer_with_context(question: Optional[str] = None, mode: str = "answer", source_text: Optional[str] = None) -> str:
+    if not st.session_state.pdf_text:
+        return "Please upload a PDF first so I can read it."
+    base_instructions = "You are StudyMate, an assistant that answers student questions using ONLY the content from the provided PDF."
+    pdf_snippet = st.session_state.pdf_text[:120000]
+    if mode == "summarize":
+        prompt = base_instructions + "\n\nPlease provide a short summary of the PDF.\n\nPDF:\n" + pdf_snippet
+    elif mode == "simplify" and source_text:
+        prompt = base_instructions + "\n\nSimplify this text:\n" + source_text + "\n\nPDF (for reference):\n" + pdf_snippet
+    elif mode == "expand" and source_text:
+        prompt = base_instructions + "\n\nExpand and explain this text in more detail:\n" + source_text + "\n\nPDF (for reference):\n" + pdf_snippet
+    else:
+        q = question or ""
+        prompt = base_instructions + f"\n\nQuestion: {q}\n\nPDF:\n" + pdf_snippet
+    response = granite_api_query(prompt)
+    return response
+
+if ask and user_input:
+    st.session_state.messages.append({"role": "user", "text": user_input})
+    bot_reply = answer_with_context(question=user_input, mode="answer")
+    st.session_state.messages.append({"role": "bot", "text": bot_reply})
+    st.session_state.user_input_box = ""
+    st.experimental_rerun()
+
+if simplify:
+    last_bot = None
+    for m in reversed(st.session_state.messages):
+        if m["role"] == "bot":
+            last_bot = m["text"]
+            break
+    if last_bot:
+        st.session_state.messages.append({"role": "user", "text": "Please simplify the previous answer."})
+        reply = answer_with_context(mode="simplify", source_text=last_bot)
+        st.session_state.messages.append({"role": "bot", "text": reply})
+        st.experimental_rerun()
+    else:
+        st.warning("No previous bot answer to simplify. Please ask a question first.")
+
+if expand:
+    last_bot = None
+    for m in reversed(st.session_state.messages):
+        if m["role"] == "bot":
+            last_bot = m["text"]
+            break
+    if last_bot:
+        st.session_state.messages.append({"role": "user", "text": "Please expand the previous answer."})
+        reply = answer_with_context(mode="expand", source_text=last_bot)
+        st.session_state.messages.append({"role": "bot", "text": reply})
+        st.experimental_rerun()
+    else:
+        st.warning("No previous bot answer to expand. Please ask a question first.")
+
+if summarize:
+    st.session_state.messages.append({"role": "user", "text": "Please summarize the PDF."})
+    summary_text = answer_with_context(mode="summarize")
+    st.session_state.last_summary = summary_text
+    st.session_state.messages.append({"role": "bot", "text": summary_text})
+
+if st.session_state.last_summary:
+    st.download_button("Download summary as .txt", st.session_state.last_summary, file_name="summary.txt")
+
+if st.session_state.messages:
+    last_bot = None
+    for m in reversed(st.session_state.messages):
+        if m["role"] == "bot":
+            last_bot = m["text"]
+            break
+    if last_bot:
+        st.download_button("Download last answer as .txt", last_bot, file_name="answer.txt")
